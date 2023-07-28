@@ -1,0 +1,14 @@
+---
+- name: Create Lambda-Functions
+  hosts: local
+  gather_facts: True
+  vars:
+    location: eu-west-1
+  tasks:
+    - include_vars:
+        file: ../vars/common.yml
+
+    - include_vars:
+        file: "functions/{{ function }}/info.yml"
+
+    - include: playbooks/lambda.yml

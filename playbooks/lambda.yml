@@ -1,0 +1,256 @@
+---
+#
+# Create Deployment Package
+#
+
+- name: default resource names when we don't have a function_suffix
+  # these are not optimal but are retained for backwards compatibility
+  set_fact:
+    function_path: "{{ function }}"
+    function_name: "{{ function }}"
+    function_name_nodash: "{{ function }}"
+    cloudwatch_event_rule_name: "soms-{{ location }}-{{ function }}"
+
+- name: override resource names when function_suffix is defined
+  set_fact:
+    function_name: "{{ function }}-{{ function_suffix }}-"
+    function_name_nodash: "{{ function }}-{{ function_suffix }}"
+    cloudwatch_event_rule_name: "paas-infra-{{ function_suffix }}-{{ function }}"
+  when: function_suffix is defined and function_suffix
+
+- name: delete tmp dir
+  file:
+    path: ./tmp
+    state: absent
+    force: yes
+  tags:
+    - build
+
+- name: create tmp dir
+  file:
+    path: "./tmp/{{ function_path }}"
+    state: directory
+  tags:
+    - build
+
+- name: create build dir
+  file:
+    path: "./build"
+    state: directory
+  tags:
+    - build
+
+- name: copy code in tmp
+  copy:
+    src: "{{ item }}"
+    dest: "./tmp/{{ function_path }}/"
+  with_fileglob:
+    - "./functions/{{ function_path }}/*.py"
+    - "./functions/{{ function_path }}/requirements.txt"
+  tags:
+    - build
+
+- name: get absolute path
+  changed_when: false
+  command: pwd
+  args:
+    chdir: ./tmp
+  register: abs_tmp_path
+  tags:
+    - always
+
+- name: check that requirements.txt exists
+  changed_when: false
+  stat:
+    path: '{{ abs_tmp_path.stdout }}/{{ function_path }}/requirements.txt'
+  register: requirements_result
+  tags:
+    - build
+
+- name: install all library dependencies
+  when: requirements_result.stat.exists
+  shell: "pip install -t {{ abs_tmp_path.stdout }}/{{ function_path }}/ -r {{ abs_tmp_path.stdout }}/{{ function_path }}/requirements.txt"
+  tags:
+    - build
+
+- name: find unnecessary files
+  find:
+    paths: "{{ abs_tmp_path.stdout }}/{{ function_path }}"
+    patterns: "*.py[co]"
+  register: find_result
+  tags:
+    - build
+
+- name: delete unnecessary files
+  file:
+    path: "{{ item.path }}"
+    state: absent
+  with_items: "{{ find_result.files }}"
+  tags:
+    - build
+
+- name: remove any old zip
+  file:
+    path: ./build/{{ function_path }}.zip
+    state: absent
+  tags:
+    - build
+
+- name: zip package
+  archive:
+    path: "./tmp/{{ function_path }}/*"
+    dest: "./build/{{function_path}}.zip"
+    format: zip
+  tags:
+    - build
+
+#
+# Copy to S3
+#
+
+- name: copy package to s3
+  aws_s3:
+    profile: "{{ profile }}"
+    region: "{{ location }}"
+    bucket: "{{ infra_bucket[sterling_account] }}"
+    object: "/code/lambda/{{ function_path }}.zip"
+    src: build/{{ function_path }}.zip
+    mode: put
+  tags:
+    - s3_upload
+
+- name: get s3 version ID of latest
+  command: >
+    aws s3api head-object
+      --bucket {{ infra_bucket[sterling_account] }}
+      --key code/lambda/{{ function_path }}.zip
+  environment:
+    AWS_PROFILE: "{{ profile }}"
+  register: s3_object_version_result
+  tags:
+    - lambda
+
+#
+# IAM role creation and load/attach policies
+#
+
+- name: Create IAM Managed Policy
+  iam_managed_policy:
+    profile: "{{ profile }}"
+    policy_name: "{{ function_name }}Policy"
+    policy: "{{ lookup('file', './functions/{{ function_path }}/{{ function_path }}_policy.json') }}"
+    state: present
+
+- name: Create IAM role for Lambda function
+  iam_role:
+    profile: "{{ profile }}"
+    region: "{{ location }}"
+    name: '{{ function_name }}Lambda'
+    boundary: "arn:aws:iam::{{ environment_details['sterling-' + sterling_account][location]['account_number'] }}:policy/ccoe/js-developer"
+    state: present
+    create_instance_profile: false
+    assume_role_policy_document:
+      Version: '2012-10-17'
+      Statement:
+      - Action: sts:AssumeRole
+        Effect: Allow
+        Principal:
+          Service: lambda.amazonaws.com
+    managed_policy:
+      - "arn:aws:iam::{{ environment_details['sterling-' + sterling_account][location]['account_number'] }}:policy/{{ function_name }}Policy"
+  tags:
+    - iam
+
+#
+# Lambda creation with ansible
+#
+
+- name: Create Lambda function
+  lambda:
+    profile: "{{ profile }}"
+    aws_region: "{{ location }}"
+    name: "{{ function_name_nodash }}"
+    description: "{{ description }}"
+    state: present
+    runtime: "{{ runtime | default('python3.9') }}"
+    handler: "{{ handler }}"
+    role: "arn:aws:iam::{{ environment_details['sterling-' + sterling_account][location]['account_number'] }}:role/{{ function_name }}Lambda"
+    s3_bucket: "{{ infra_bucket[sterling_account] }}"
+    s3_key: "code/lambda/{{ function_path }}.zip"
+    s3_object_version: '{{ (s3_object_version_result.stdout|from_json)["VersionId"] }}'
+    environment_variables: "{{ lambda_params }}"
+    timeout: "{{ lambda_timeout }}"
+    vpc_security_group_ids: "{{ vpc_sg_id | default(omit) }}"
+    vpc_subnet_ids: "{{ vpc_subnet_ids | default(omit) }}"
+  register: function_details
+  tags:
+    - lambda
+
+#
+# CloudWatchEvent creation with ansible
+#
+
+- name: Create cloud watch event to schedule lambda event_pattern
+  cloudwatchevent_rule:
+    profile: "{{ profile }}"
+    region: "{{ location }}"
+    name: "{{ (cloudwatch_event_rule_name + '-' + item.key + 'CWEvent')[:63] }}"
+    description: "{{ item.value.description }}"
+    state: present
+    event_pattern:  '{{ item.value.pattern | to_json }}'
+    targets:
+      - id: "{{ item.key }}"
+        arn: "arn:aws:lambda:{{ location }}:{{ environment_details['sterling-' + sterling_account][location]['account_number'] }}:function:{{ function_name_nodash }}"
+  with_dict: "{{ cw_rules_event_pattern }}"
+  register: cloudwatch_event_pattern
+  tags:
+    - lambda
+  when: cw_rules_event_pattern is defined
+
+- name: Create cloud watch event to schedule lambda schedule_pattern
+  cloudwatchevent_rule:
+    profile: "{{ profile }}"
+    region: "{{ location }}"
+    name: "{{ (cloudwatch_event_rule_name + '-' + item.key + 'CWEvent')[:63] }}"
+    description: "{{ item.value.description }}"
+    state: present
+    schedule_expression:  "{{ item.value.schedule_pattern }}"
+    targets:
+      - id: "{{ item.key }}"
+        arn: "arn:aws:lambda:{{ location }}:{{ environment_details['sterling-' + sterling_account][location]['account_number'] }}:function:{{ function_name_nodash }}"
+        input: "{{ item.value.lambda_args | to_json }}"
+  with_dict: "{{ cw_rules_schedule_pattern }}"
+  register: cloudwatch_schedule_pattern
+  tags:
+    - lambda
+  when: cw_rules_schedule_pattern is defined
+
+- name: Attach permission to lambda function for cloud watch event_pattern
+  when: cw_rules_event_pattern is defined
+  lambda_policy:
+    profile: "{{ profile }}"
+    region: "{{ location }}"
+    action: lambda:InvokeFunction
+    function_name: "{{ function_name_nodash }}"
+    principal: "events.amazonaws.com"
+    source_arn: "{{ item.rule.arn }}"
+    state: present
+    statement_id: "{{ item.rule.name }}CWPermission"
+  with_items: "{{ cloudwatch_event_pattern.results }}"
+  tags:
+    - lambda
+
+- name: Attach permission to lambda function for cloud watch event schedule_pattern
+  when: cw_rules_schedule_pattern is defined
+  lambda_policy:
+    profile: "{{ profile }}"
+    aws_region: "{{ location }}"
+    action: lambda:InvokeFunction
+    function_name: "{{ function_name_nodash }}"
+    principal: "events.amazonaws.com"
+    source_arn: "{{ item.rule.arn }}"
+    state: present
+    statement_id: "{{ item.rule.name }}CWPermission"
+  with_items: "{{ cloudwatch_schedule_pattern.results }}"
+  tags:
+    - lambda

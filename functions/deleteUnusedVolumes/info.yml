@@ -1,0 +1,13 @@
+---
+description: "delete unsed EBS volumes"
+handler: "delete_unused_volumes.lambda_handler"
+lambda_timeout: 600
+runtime: python3.7
+create_cw_rule: false
+cw_rules_schedule_pattern:
+  CwscheduleEvents:
+    description: "Calls Lambda function that dynamically delete unsed volumes"
+    schedule_pattern: "cron(0 1 * * ? *)"
+    lambda_args: ''
+lambda_params:
+  LOG_LEVEL: "INFO"
